@@ -2,6 +2,10 @@ import os
 import json
 import sys
 import re
+import requests
+import hashlib
+from pathlib import Path
+from checkpoint import process_with_checkpoint
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict
 from queue import Queue
@@ -106,29 +110,9 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
             "content": item['summary']
         })
         item['AI'] = response.model_dump()
-    except langchain_core.exceptions.OutputParserException as e:
-        # 尝试从错误信息中提取 JSON 字符串并修复
-        error_msg = str(e)
-        partial_data = {}
-        
-        if "Function Structure arguments:" in error_msg:
-            try:
-                # 提取 JSON 字符串
-                json_str = error_msg.split("Function Structure arguments:", 1)[1].strip().split('are not valid JSON')[0].strip()
-                # 预处理 LaTeX 数学符号 - 使用四个反斜杠来确保正确转义
-                json_str = json_str.replace('\\', '\\\\')
-                # 尝试解析修复后的 JSON
-                partial_data = json.loads(json_str)
-            except Exception as json_e:
-                print(f"Failed to parse JSON for {item.get('id', 'unknown')}: {json_e}", file=sys.stderr)
-        
-        # Merge partial data with defaults to ensure all fields exist
-        item['AI'] = {**default_ai_fields, **partial_data}
-        print(f"Using partial AI data for {item.get('id', 'unknown')}: {list(partial_data.keys())}", file=sys.stderr)
     except Exception as e:
-        print(f"Unexpected error for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
-        raise RuntimeError(f"AI request failed for {item.get('id', 'unknown')}") from e
-    
+        raise RuntimeError(f"AI response failed for {item.get('id', 'unknown')}: {e}") from e
+
     # Final validation to ensure all required fields exist
     for field in default_ai_fields.keys():
         if field not in item['AI']:
@@ -159,33 +143,16 @@ def process_all_items(data: List[Dict], model_name: str, language: str, max_work
 
     chain = prompt_template | llm
     
-    # 使用线程池并行处理
-    processed_data = [None] * len(data)  # 预分配结果列表
-    processing_errors = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # 提交所有任务
-        future_to_idx = {
-            executor.submit(process_single_item, chain, item, language): idx
-            for idx, item in enumerate(data)
-        }
-        
-        # 使用tqdm显示进度
-        for future in tqdm(
-            as_completed(future_to_idx),
-            total=len(data),
-            desc="Processing items"
-        ):
-            idx = future_to_idx[future]
-            try:
-                result = future.result()
-                processed_data[idx] = result
-            except Exception as e:
-                print(f"Item at index {idx} generated an exception: {e}", file=sys.stderr)
-                processing_errors.append(str(e))
+    signature = hashlib.sha256(
+        json.dumps([model_name, language, os.environ.get("OPENAI_BASE_URL", ""),
+                    system, template, Path("structure.py").read_text(encoding="utf-8")],
+                   ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    return process_with_checkpoint(
+        data, lambda item: process_single_item(chain, item, language),
+        Path("../.ai-checkpoints"), signature,
+    )
 
-    raise_if_processing_failed(processing_errors)
-    
-    return processed_data
 
 def main():
     args = parse_args()
@@ -194,10 +161,6 @@ def main():
 
     # 检查并删除目标文件
     target_file = args.data.replace('.jsonl', f'_AI_enhanced_{language}.jsonl')
-    if os.path.exists(target_file):
-        os.remove(target_file)
-        print(f'Removed existing file: {target_file}', file=sys.stderr)
-
     # 读取数据
     data = []
     with open(args.data, "r") as f:
@@ -224,10 +187,13 @@ def main():
     )
     
     # 保存结果
-    with open(target_file, "w") as f:
+    temporary_file = target_file + ".tmp"
+    with open(temporary_file, "w", encoding="utf-8") as f:
         for item in processed_data:
             if item is not None:
                 f.write(json.dumps(item) + "\n")
+    os.replace(temporary_file, target_file)
 
 if __name__ == "__main__":
     main()
+
