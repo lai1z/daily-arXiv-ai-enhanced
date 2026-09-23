@@ -9,6 +9,13 @@ on:
   workflow_dispatch:
 
 
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-arxiv
+  cancel-in-progress: false
+
 jobs:
   build:
 
@@ -16,6 +23,23 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Restore durable AI checkpoints
+      run: |
+        if git ls-remote --exit-code --heads origin data > /dev/null 2>&1; then
+          git fetch origin data
+          if git cat-file -e FETCH_HEAD:.ai-checkpoints 2>/dev/null; then
+            git archive FETCH_HEAD .ai-checkpoints | tar -x
+          fi
+        fi
+
+    - name: Restore AI checkpoints
+      uses: actions/cache/restore@v4
+      with:
+        path: .ai-checkpoints
+        key: ai-checkpoints-v1-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          ai-checkpoints-v1-
+
     - name: Install dependencies
       run: |
         curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -119,6 +143,25 @@ jobs:
         fi
         echo "AI增强处理完成 / AI enhancement processing completed"
         
+    - name: Save AI checkpoints
+      if: always()
+      uses: actions/cache/save@v4
+      with:
+        path: .ai-checkpoints
+        key: ai-checkpoints-v1-${{ github.run_id }}-${{ github.run_attempt }}
+
+    - name: Back up AI results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ai-results-${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          .ai-checkpoints/
+          data/*.jsonl
+        include-hidden-files: true
+        if-no-files-found: ignore
+        retention-days: 30
+
     - name: Convert to Markdown
       if: steps.dedup_check.outputs.has_new_content == 'true'
       run: |
@@ -246,7 +289,7 @@ jobs:
         # 添加其他可能的代码变更，但排除 data/ 目录和 assets/file-list.txt
         # Add other possible code changes, but exclude data/ directory and assets/file-list.txt
         git add -A
-        git reset -- data/* assets/file-list.txt 2>/dev/null || true
+        git reset -- data/* assets/file-list.txt .ai-checkpoints 2>/dev/null || true
         
         # 检查是否有代码变更需要提交 / Check if there are code changes to commit
         if git diff --staged --quiet; then
@@ -288,6 +331,7 @@ jobs:
         # 创建临时目录保存数据文件 / Create temporary directory to save data files
         mkdir -p /tmp/data_files/data
         mkdir -p /tmp/data_files/assets
+        cp -r .ai-checkpoints /tmp/data_files/
         
         # 复制数据文件到临时目录 / Copy data files to temporary directory
         cp -r data/* /tmp/data_files/data/ 2>/dev/null || true
@@ -311,6 +355,7 @@ jobs:
         rm -rf data/*.jsonl 2>/dev/null || true
         rm -f data/*.md 2>/dev/null || true
         rm -f assets/file-list.txt 2>/dev/null || true
+        rm -rf .ai-checkpoints
         
         # 检查 data 分支是否存在 / Check if data branch exists
         if git ls-remote --heads origin data | grep -q data; then
@@ -336,10 +381,13 @@ jobs:
         mkdir -p data assets
         cp -r /tmp/data_files/data/* data/ 2>/dev/null || true
         cp /tmp/data_files/assets/file-list.txt assets/ 2>/dev/null || true
+        cp -r /tmp/data_files/.ai-checkpoints .
+        ls data/*.jsonl | sed 's|data/||' > assets/file-list.txt
         
         # 只添加数据文件 / Only add data files
         git add data/* 2>/dev/null || true
         git add assets/file-list.txt 2>/dev/null || true
+        git add -f .ai-checkpoints/
         
         # 检查是否有数据变更需要提交 / Check if there are data changes to commit
         if git diff --staged --quiet; then
@@ -371,3 +419,4 @@ jobs:
             fi
           fi
         done
+
